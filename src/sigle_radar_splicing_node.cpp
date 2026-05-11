@@ -25,12 +25,12 @@ namespace fs = std::filesystem;
 class SingleRadarSplicingNode : public rclcpp::Node {
 public:
     SingleRadarSplicingNode() : Node("sigle_radar_splicing_node") {
-        this->declare_parameter("lidar_ip", "192.168.2.83");
+        this->declare_parameter("lidar_ip", "192.168.2.83");  // 雷达IP
         this->declare_parameter("lidar_port", 1112);
-        this->declare_parameter("segment_time_sec", 0.35);
-        this->declare_parameter("odom_threshold_m", 0.025);
-        this->declare_parameter("receiver_ip", "192.168.2.152");
-        this->declare_parameter("zmq_port", 5555);
+        this->declare_parameter("segment_time_sec", 0.35);   // 默认拼接周期   
+        this->declare_parameter("odom_threshold_m", 0.025);  // 检测小车移动距离
+        this->declare_parameter("receiver_ip", "192.168.2.152"); // 接收端主机ip
+        this->declare_parameter("zmq_port", 5555);              // 自定义端口号
         this->declare_parameter("pcd_save_dir", "/tmp/radar_pcd");
 
         radar_ip_ = this->get_parameter("lidar_ip").as_string();
@@ -65,14 +65,36 @@ public:
 
         publish_thread_ = std::thread(&SingleRadarSplicingNode::PublishWorker, this);
 
+        rclcpp::on_shutdown([this]() {
+            running_ = false;
+            {
+                std::lock_guard<std::mutex> lock(queue_mutex_);
+                queue_cv_.notify_all();
+            }
+        });
+
         RCLCPP_INFO(this->get_logger(), "节点启动 | 周期 %.2f 秒 | 静止阈值 %.3f 米", 
                     segment_time_sec_, odom_threshold_m_);
     }
 
     ~SingleRadarSplicingNode() {
         running_ = false;
-        if (publish_thread_.joinable()) publish_thread_.join();
-        if (radar_connect_) delete radar_connect_;
+        
+        // 强制唤醒线程
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            queue_cv_.notify_all();      // ← 改成 notify_all
+        }
+        
+        if (publish_thread_.joinable()) {
+            publish_thread_.join();
+        }
+        
+        if (publish_timer_) {
+            publish_timer_->cancel();
+            publish_timer_.reset();
+        }
+        
     }
 
 private:
@@ -211,21 +233,33 @@ private:
     }
 
     void PublishWorker() {
-        while (running_) {
+        while (running_ && rclcpp::ok()) {          
             std::vector<PointData> points_to_pub;
+            
             {
                 std::unique_lock<std::mutex> lock(queue_mutex_);
-                queue_cv_.wait(lock, [this]() { return !ready_queue_.empty() || !running_; });
-                if (!running_ && ready_queue_.empty()) break;
+                
+                //  wait_for + 超时 + 完整退出条件
+                queue_cv_.wait_for(lock, std::chrono::milliseconds(300),
+                    [this]() { 
+                        return !ready_queue_.empty() || !running_ || !rclcpp::ok(); 
+                    });
+                
+                if (!running_ || !rclcpp::ok()) {
+                    break;
+                }
+                
                 if (!ready_queue_.empty()) {
                     points_to_pub = std::move(ready_queue_.front());
                     ready_queue_.pop_front();
                 }
-            }
+            }   // 锁在这里释放
+            
             if (!points_to_pub.empty()) {
                 PublishOnePackage(points_to_pub);
             }
         }
+        
     }
 
     // PCD + ZIP + ZeroMQ 发送 
@@ -279,7 +313,7 @@ private:
         zmq_publisher_->send(msg, zmq::send_flags::none);
 
         RCLCPP_INFO(this->get_logger(), 
-            "✅ 已发送第 %d 个 zip 包 | 原始:%zu → 过滤后:%zu | 大小:%.2f MB", 
+            "已发送第 %d 个 zip 包 | 原始:%zu → 过滤后:%zu | 大小:%.2f MB", 
             zip_package_id_, points_to_pub.size(), cloud_filtered->size(), size / (1024.0 * 1024.0));
 
         fs::remove(pcd_path);
@@ -289,7 +323,8 @@ private:
 
 int main(int argc, char** argv) {
     rclcpp::init(argc, argv);
-    rclcpp::spin(std::make_shared<SingleRadarSplicingNode>());
-    rclcpp::shutdown();
+    auto node = std::make_shared<SingleRadarSplicingNode>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();   // 显式调用
     return 0;
 }
