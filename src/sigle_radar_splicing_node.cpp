@@ -1,15 +1,10 @@
 #include <rclcpp/rclcpp.hpp>
-#include <sensor_msgs/msg/point_cloud2.hpp>
-#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <std_msgs/msg/float32.hpp>
 #include <mutex>
 #include <vector>
 #include <string>
 #include <chrono>
-#include <iomanip>
-#include <sstream>
-#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <deque>
@@ -20,6 +15,7 @@
 #include <zmq.hpp>
 #include <pcl/point_types.h>
 #include <pcl/io/pcd_io.h>
+#include <pcl/filters/radius_outlier_removal.h>
 #include <cstdlib>
 
 #include "sigle_radar/radarconnect.h"
@@ -33,9 +29,7 @@ public:
         this->declare_parameter("lidar_port", 1112);
         this->declare_parameter("segment_time_sec", 0.35);
         this->declare_parameter("odom_threshold_m", 0.025);
-
-        // ==================== 新增：ZeroMQ 参数 ====================
-        this->declare_parameter("receiver_ip", "192.168.2.152");   // Host B IP
+        this->declare_parameter("receiver_ip", "192.168.2.152");
         this->declare_parameter("zmq_port", 5555);
         this->declare_parameter("pcd_save_dir", "/tmp/radar_pcd");
 
@@ -43,30 +37,16 @@ public:
         radar_port_ = this->get_parameter("lidar_port").as_int();
         segment_time_sec_ = this->get_parameter("segment_time_sec").as_double();
         odom_threshold_m_ = this->get_parameter("odom_threshold_m").as_double();
-
         receiver_ip_ = this->get_parameter("receiver_ip").as_string();
         zmq_port_ = this->get_parameter("zmq_port").as_int();
         pcd_save_dir_ = this->get_parameter("pcd_save_dir").as_string();
 
-        // 创建临时目录
-        if (!fs::exists(pcd_save_dir_)) {
-            fs::create_directories(pcd_save_dir_);
-        }
+        fs::create_directories(pcd_save_dir_);
 
-        // 初始化 ZeroMQ Publisher
+        // ZeroMQ 初始化
         zmq_context_ = std::make_unique<zmq::context_t>(1);
         zmq_publisher_ = std::make_unique<zmq::socket_t>(*zmq_context_, zmq::socket_type::pub);
-        std::string bind_addr = "tcp://*:" + std::to_string(zmq_port_);
-        zmq_publisher_->bind(bind_addr);
-
-        zmq_publisher_->set(zmq::sockopt::sndhwm, 50);
-        zmq_publisher_->set(zmq::sockopt::sndbuf, 64 * 1024 * 1024); // 64MB
-
-        RCLCPP_INFO(this->get_logger(), "ZeroMQ PUB 已绑定 %s | 目标接收端: %s", 
-                    bind_addr.c_str(), receiver_ip_.c_str());
-        // =======================================================
-
-        pointcloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/SingleRadar/pointcloud", 10);  // 可保留或后面删除
+        zmq_publisher_->bind("tcp://*:" + std::to_string(zmq_port_));
 
         odom_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
             "/odom", 10, std::bind(&SingleRadarSplicingNode::OdomCallback, this, std::placeholders::_1));
@@ -81,7 +61,6 @@ public:
                       std::placeholders::_1, std::placeholders::_2,
                       std::placeholders::_3, std::placeholders::_4,
                       std::placeholders::_5, std::placeholders::_6));
-
         radar_connect_->startConnect();
 
         publish_thread_ = std::thread(&SingleRadarSplicingNode::PublishWorker, this);
@@ -91,24 +70,19 @@ public:
     }
 
     ~SingleRadarSplicingNode() {
-        {
-            std::lock_guard<std::mutex> lock(queue_mutex_);
-            running_ = false;
-            queue_cv_.notify_one();
-        }
+        running_ = false;
         if (publish_thread_.joinable()) publish_thread_.join();
         if (radar_connect_) delete radar_connect_;
     }
 
 private:
-    // ==================== 新增成员变量 ====================
+    // ZeroMQ
     std::unique_ptr<zmq::context_t> zmq_context_;
     std::unique_ptr<zmq::socket_t> zmq_publisher_;
     std::string receiver_ip_;
     int zmq_port_ = 5555;
     std::string pcd_save_dir_;
     int zip_package_id_ = 0;
-    // ===================================================
 
     RadarConnect* radar_connect_ = nullptr;
     std::string radar_ip_;
@@ -137,11 +111,11 @@ private:
     std::atomic<bool> running_{true};
     std::thread publish_thread_;
 
-    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_pub_;
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
     rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr control_sub_;
+    rclcpp::TimerBase::SharedPtr publish_timer_;
 
-    // ====================== 回调函数（保持不变） ======================
+    //  Z 拼接：odom的x
     void OnLadarFrameCallback(const std::string& /*mark*/, void* /*priv*/,
                               int64_t /*timestamp*/,
                               const std::vector<float>& xs,
@@ -149,8 +123,8 @@ private:
                               const std::vector<float>& intensities) {
         if (!is_active_) return;
         global_frame_id_++;
-        std::lock_guard<std::mutex> lock(queue_mutex_);
 
+        std::lock_guard<std::mutex> lock(queue_mutex_);
         double current_z = (latest_odom_x_ - reference_odom_x_) * 1000.0;
 
         for (size_t i = 0; i < xs.size(); ++i) {
@@ -179,8 +153,10 @@ private:
                 if (!current_buffer_.empty()) {
                     std::vector<PointData> last_package;
                     last_package.swap(current_buffer_);
-                    PublishOnePackage(last_package);        // 处理剩余点云
+                    ready_queue_.push_back(std::move(last_package));
+                    queue_cv_.notify_one();
                 }
+                if (publish_timer_) publish_timer_->cancel();
                 RCLCPP_INFO(this->get_logger(), "拼接已停止");
             }
             return;
@@ -200,45 +176,100 @@ private:
         global_frame_id_ = 0;
         package_id_ = 0;
 
+        lock.unlock();
+
+        if (publish_timer_) publish_timer_->cancel();
+        publish_timer_ = this->create_wall_timer(
+            std::chrono::duration<double>(msg->data),
+            std::bind(&SingleRadarSplicingNode::TimerPublishCallback, this));
+
         RCLCPP_INFO(this->get_logger(), "开始拼接 | 周期 %.2f 秒", msg->data);
     }
 
-    void TimerPublishCallback() { /* 保持你原来的实现 */ 
-        // ...（此处保持你原来的 TimerPublishCallback 代码不变）
-        // 只需确保最后调用 PublishOnePackage
+    void TimerPublishCallback() {
+        std::vector<PointData> package_to_queue;
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            double moved = std::abs(latest_odom_x_ - last_publish_odom_x_);
+            if (moved < odom_threshold_m_) {
+                current_buffer_.clear();
+                RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                    "小车静止 (%.4f < %.3f 米)，跳过本次切包", moved, odom_threshold_m_);
+                return;
+            }
+            if (current_buffer_.empty()) return;
+
+            package_to_queue.swap(current_buffer_);
+        }
+
+        {
+            std::lock_guard<std::mutex> qlock(queue_mutex_);
+            ready_queue_.push_back(std::move(package_to_queue));
+            queue_cv_.notify_one();
+        }
+        last_publish_odom_x_ = latest_odom_x_;
     }
 
-    void PublishWorker() { /* 保持你原来的实现 */ }
+    void PublishWorker() {
+        while (running_) {
+            std::vector<PointData> points_to_pub;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                queue_cv_.wait(lock, [this]() { return !ready_queue_.empty() || !running_; });
+                if (!running_ && ready_queue_.empty()) break;
+                if (!ready_queue_.empty()) {
+                    points_to_pub = std::move(ready_queue_.front());
+                    ready_queue_.pop_front();
+                }
+            }
+            if (!points_to_pub.empty()) {
+                PublishOnePackage(points_to_pub);
+            }
+        }
+    }
 
-    // ====================== 新核心函数 ======================
+    // PCD + ZIP + ZeroMQ 发送 
     void PublishOnePackage(std::vector<PointData>& points_to_pub) {
         if (points_to_pub.empty()) return;
-
         zip_package_id_++;
 
+        // 1. 转为 PCL 点云
         pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>());
         cloud->reserve(points_to_pub.size());
         for (const auto& p : points_to_pub) {
-            pcl::PointXYZI pt;
-            pt.x = p.x / 1000.0f;
-            pt.y = p.y / 1000.0f;
-            pt.z = p.z / 1000.0f;
-            pt.intensity = p.intensity;
-            cloud->push_back(pt);
+            cloud->push_back({p.x/1000.0f, p.y/1000.0f, p.z/1000.0f, p.intensity});
         }
 
-        std::string pcd_path = pcd_save_dir_ + "/temp_" + std::to_string(zip_package_id_) + ".pcd";
-        pcl::io::savePCDFileBinary(pcd_path, *cloud);
+        // 2. XY 裁剪
+        pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_xy(new pcl::PointCloud<pcl::PointXYZI>());
+        for (const auto& p : *cloud) {
+            if ((p.y > -1.5 && p.y < 2.0) && (p.x > -8.0 && p.x < 8.0)) {   // 根据场景调整范围
+                cloud_xy->push_back(p);
+            }
+        }
 
+        // 3. 半径滤波 
+        pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_filtered(new pcl::PointCloud<pcl::PointXYZI>());
+        if (cloud_xy->size() > 100) {
+            pcl::RadiusOutlierRemoval<pcl::PointXYZI> radius_filter;
+            radius_filter.setInputCloud(cloud_xy);
+            radius_filter.setRadiusSearch(0.55);        // 半径（米）
+            radius_filter.setMinNeighborsInRadius(10);  // 邻居数
+            radius_filter.setNegative(false);
+            radius_filter.filter(*cloud_filtered);
+        } else {
+            cloud_filtered = cloud_xy;
+        }
+
+        // 4. 保存 PCD（滤波后版本）
+        std::string pcd_path = pcd_save_dir_ + "/temp_" + std::to_string(zip_package_id_) + ".pcd";
+        pcl::io::savePCDFileBinary(pcd_path, *cloud_filtered);
+
+        // 5. 压缩 + 发送
         std::string zip_path = pcd_save_dir_ + "/scan_" + std::to_string(zip_package_id_) + ".zip";
-        std::string cmd = "zip -q -j " + zip_path + " " + pcd_path;
-        std::system(cmd.c_str());
+        std::system(("zip -q -j " + zip_path + " " + pcd_path).c_str());
 
         std::ifstream ifs(zip_path, std::ios::binary | std::ios::ate);
-        if (!ifs) {
-            RCLCPP_ERROR(this->get_logger(), "读取 zip 失败: %s", zip_path.c_str());
-            return;
-        }
         std::streamsize size = ifs.tellg();
         ifs.seekg(0, std::ios::beg);
         std::vector<char> data(size);
@@ -248,12 +279,12 @@ private:
         zmq_publisher_->send(msg, zmq::send_flags::none);
 
         RCLCPP_INFO(this->get_logger(), 
-            "✅ 已发送第 %d 个 zip 包 | 点数:%zu | 大小:%.2f MB", 
-            zip_package_id_, points_to_pub.size(), size / (1024.0 * 1024.0));
+            "✅ 已发送第 %d 个 zip 包 | 原始:%zu → 过滤后:%zu | 大小:%.2f MB", 
+            zip_package_id_, points_to_pub.size(), cloud_filtered->size(), size / (1024.0 * 1024.0));
 
         fs::remove(pcd_path);
-        // fs::remove(zip_path);   // 如需保留 zip 可取消注释
     }
+    
 };
 
 int main(int argc, char** argv) {
